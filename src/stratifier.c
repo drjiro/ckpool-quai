@@ -3832,9 +3832,8 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 		server = 0;
 	client->server = server;
 
-	/* For btcsolo mode with share_diff from GBT, use that instead of startdiff */
-	if (ckp->btcsolo && sdata->current_workbase && sdata->current_workbase->share_diff > 0) {
-		/* Ensure minimum difficulty of 1 for miners */
+	/* Use startdiff for vardiff; GBT target diff (~76M) is too high for ASIC shares */
+	if (0) { /* disabled GBT-target-as-diff */
 		double share_diff = sdata->current_workbase->share_diff;
 		client->diff = client->old_diff = share_diff < 1.0 ? 1 : share_diff;
 		strncpy(client->target, sdata->current_workbase->target, 68);
@@ -3843,10 +3842,9 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 			  id, client->diff, share_diff);
 	} else {
 		client->diff = client->old_diff = ckp->startdiff;
-		if (sdata->current_workbase && sdata->current_workbase->target[0]) {
-			strncpy(client->target, sdata->current_workbase->target, 68);
-			strncpy(client->old_target, sdata->current_workbase->target, 68);
-		}
+		/* Disabled: do not set client target from GBT network target */
+		/* Network target (~90M diff) would reject all ASIC shares */
+		/* client->target stays empty; share validation falls back to diff comparison */
 		LOGNOTICE("Client %ld: Set initial diff to %ld from ckp->startdiff=%ld",
 			  id, client->diff, ckp->startdiff);
 	}
@@ -6871,30 +6869,9 @@ out_nowb:
 
 		suffix_string(wdiff, wdiffsuffix, 16, 0);
 
-		/* Use old target for shares from before the diff change */
-		if (id < client->diff_change_job_id && client->old_target[0]) {
-			target_to_use = client->old_target;
-		} else if (client->target[0]) {
-			target_to_use = client->target;
-		} else if (wb && wb->target[0]) {
-			/* Fallback to workbase target if client target not set */
-			target_to_use = wb->target;
-		} else {
-			target_to_use = NULL;
-		}
-
-		/* Use the share target to validate the hash.
-		 * This is more accurate than comparing difficulty values. */
-		if (target_to_use) {
-			hex2bin(target, target_to_use, 32);
-			/* Target hex string is big-endian, but hash is little-endian.
-			 * Byte-swap target to match hash byte order for fulltest() */
-			bswap_256(target_swap, target);
-			meets_target = fulltest(hash, target_swap);
-		} else {
-			/* Fallback to difficulty comparison if target is not available */
-			meets_target = (sdiff >= diff);
-		}
+		/* Disabled: always use diff comparison; network target (~90M) must not be used */
+		(void)target; (void)target_swap; (void)target_to_use;
+		meets_target = (sdiff >= diff);
 
 		if (meets_target) {
 			if (new_share(sdata, hash, id)) {
@@ -7165,11 +7142,11 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
         __inc_instance_ref(client);
         ck_wunlock(&sdata->instance_lock);
 
-        /* Update client difficulty if share_diff changed in btcsolo mode */
-        if (ckp->btcsolo && new_share_diff > 0 && client->diff != new_share_diff) {
+        /* Disabled: do not update client diff from GBT target in btcsolo mode */
+        /* GBT target diff (~76M+) is too high for ASIC shares; use vardiff/startdiff instead */
+        if (0) {
             client->old_diff = client->diff;
             strncpy(client->old_target, client->target, 68);
-            /* Ensure minimum difficulty of 1 for miners */
             client->diff = new_share_diff < 1.0 ? 1 : new_share_diff;
             if (sdata->current_workbase && sdata->current_workbase->target[0]) {
                 strncpy(client->target, sdata->current_workbase->target, 68);
@@ -7179,8 +7156,9 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
             stratum_send_diff(sdata, client);
         }
 
-        /* Update client target from current workbase if it changed (but diff didn't) */
-        if (sdata->current_workbase && sdata->current_workbase->target[0]) {
+        /* Disabled: do not update client target from GBT network target */
+        /* GBT target (~89M diff) would override startdiff target, rejecting all shares */
+        if (0) {
             if (strcmp(client->target, sdata->current_workbase->target) != 0) {
                 strncpy(client->target, sdata->current_workbase->target, 68);
                 LOGDEBUG("Updated client %ld target from workbase", client->id);

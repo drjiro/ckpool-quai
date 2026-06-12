@@ -42,6 +42,9 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		return ret;
 	}
 
+	*script = false;
+	*segwit = false;
+	return true;
 	snprintf(rpc_req, 128, "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
 	val = json_rpc_response(cs, rpc_req);
 	if (!val) {
