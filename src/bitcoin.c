@@ -400,6 +400,20 @@ retry:
 		goto out;
 	}
 	if (!json_is_null(res_val)) {
+		/* Quai submitShaBlock returns an object: {hash, number, status} */
+		if (json_is_object(res_val)) {
+			json_t *status_val = json_object_get(res_val, "status");
+			json_t *hash_val = json_object_get(res_val, "hash");
+			const char *status_str = status_val ? json_string_value(status_val) : NULL;
+			const char *hash_str = hash_val ? json_string_value(hash_val) : NULL;
+			if (status_str && strcmp(status_str, "0x1") == 0) {
+				LOGWARNING("BLOCK ACCEPTED! Hash: %s", hash_str ? hash_str : "unknown");
+				ret = true;
+				goto out;
+			}
+			LOGWARNING("BLOCK REJECTED: status=%s", status_str ? status_str : "unknown");
+			goto out;
+		}
 		res_ret = json_string_value(res_val);
 		if (res_ret && strlen(res_ret)) {
 			LOGWARNING("SUBMIT BLOCK RETURNED: %s", res_ret);

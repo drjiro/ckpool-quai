@@ -41,6 +41,8 @@ struct notify_instance {
 	bool clean;
 
 	time_t notify_time;
+
+	char *enonce1; /* Upstream enonce1 at time of notify - used to detect cross-session shares */
 };
 
 typedef struct notify_instance notify_instance_t;
@@ -1026,6 +1028,7 @@ static bool parse_notify(ckpool_t *ckp, proxy_instance_t *proxi, json_t *val)
 	ni->merkles = merkles;
 	ret = true;
 	ni->notify_time = time(NULL);
+	ni->enonce1 = proxi->enonce1 ? strdup(proxi->enonce1) : NULL;
 
 	/* Add the notify instance to the parent proxy list, not the subproxy */
 	mutex_lock(&gdata->notify_lock);
@@ -1042,6 +1045,8 @@ static bool parse_diff(proxy_instance_t *proxi, json_t *val)
 {
 	double diff = json_number_value(json_array_get(val, 0));
 
+	LOGNOTICE("Upstream proxy %d:%d set_difficulty received: %.0f (was %.0f)",
+		  proxi->id, proxi->subid, diff, proxi->diff);
 	if (diff == 0 || diff == proxi->diff)
 		return true;
 	proxi->diff = diff;
@@ -1266,6 +1271,24 @@ static bool parse_reconnect(proxy_instance_t *proxy, json_t *val)
 
 	ret = true;
 	parent = proxy->parent;
+
+	/* User proxies (created by __add_userproxy) have parent == NULL.
+	 * disable_subproxy with a NULL parent would dereference NULL in
+	 * close_proxy_socket.  Treat user proxies like parent proxies:
+	 * just set reconnect and let userproxy_recv handle the reconnect. */
+	if (!parent) {
+		proxy->reconnect = true;
+		LOGWARNING("User proxy %d:%s reconnect request, reconnecting",
+			   proxy->id, proxy->url);
+		if (!sameurl) {
+			char *oldurl = proxy->url;
+			proxy->url = url;
+			free(oldurl);
+		} else
+			free(url);
+		goto out;
+	}
+
 	disable_subproxy(gdata, parent, proxy);
 	if (parent != proxy) {
 		/* If this is a subproxy we only need to create a new one if
@@ -1336,12 +1359,14 @@ static void send_notify(ckpool_t *ckp, proxy_instance_t *proxi, notify_instance_
 	json_decref(json_msg);
 	ASPRINTF(&buf, "notify=%s", msg);
 	free(msg);
+	/* Send diff BEFORE notify so update_diff runs first. update_diff stores
+	 * the new diff in proxy->diff even with no current workbase, so the
+	 * workbase created by update_notify will inherit the correct diff.
+	 * This prevents submitting shares at the old (lower) diff threshold
+	 * when molepool bundles a difficulty increase with the new job. */
+	send_diff(ckp, proxi);
 	send_proc(ckp->stratifier, buf);
 	free(buf);
-
-	/* Send diff now as stratifier will not accept diff till it has a
-	 * valid workbase */
-	send_diff(ckp, proxi);
 }
 
 static bool parse_method(ckpool_t *ckp, proxy_instance_t *proxi, const char *msg)
@@ -1696,6 +1721,7 @@ static void clear_notify(notify_instance_t *ni)
 		json_decref(ni->jobid);
 	free(ni->coinbase1);
 	free(ni->coinbase2);
+	free(ni->enonce1);
 	free(ni);
 }
 
@@ -1748,6 +1774,7 @@ static int parse_share(gdata_t *gdata, proxy_instance_t *proxi, const char *buf)
 	int ret = 0;
 	int64_t id;
 
+	LOGWARNING("RAW<-upstream proxy %d:%d: %s", proxi->id, proxi->subid, buf);
 	val = json_loads(buf, 0, NULL);
 	if (unlikely(!val)) {
 		LOGINFO("Failed to parse upstream json msg: %s", buf);
@@ -1760,16 +1787,20 @@ static int parse_share(gdata_t *gdata, proxy_instance_t *proxi, const char *buf)
 	}
 	id = json_integer_value(idval);
 	if (unlikely(!json_get_bool(&result, val, "result"))) {
-		LOGINFO("Failed to find result in upstream json msg: %s", buf);
-		goto out;
+		/* result:null is normal for error responses (e.g. "Low difficulty share").
+		 * If an "error" field is present, treat it as a rejected share. */
+		json_t *err_field = json_object_get(val, "error");
+		if (!err_field || json_is_null(err_field)) {
+			LOGINFO("Failed to find result in upstream json msg: %s", buf);
+			goto out;
+		}
+		result = false;
 	}
 
 	mutex_lock(&gdata->share_lock);
 	HASH_FIND_I64(gdata->shares, &id, share);
-	if (share) {
+	if (share)
 		HASH_DEL(gdata->shares, share);
-		free(share);
-	}
 	mutex_unlock(&gdata->share_lock);
 
 	if (!share) {
@@ -1863,6 +1894,7 @@ static void add_json_msgq(cs_msg_t **csmsgq, proxy_instance_t *proxy, json_t **v
 	}
 	csmsg->len = strlen(csmsg->buf);
 	csmsg->proxy = proxy;
+	LOGWARNING("RAW->upstream proxy %d:%d: %s", proxy->id, proxy->subid, csmsg->buf);
 	DL_APPEND(*csmsgq, csmsg);
 }
 
@@ -1942,8 +1974,18 @@ static void *proxy_send(void *arg)
 
 		mutex_lock(&gdata->notify_lock);
 		HASH_FIND_I64(gdata->notify_instances, &id, ni);
-		if (ni)
-			jobid = json_copy(ni->jobid);
+		if (ni) {
+			/* Detect cross-session shares: job enonce1 must match current upstream enonce1.
+			 * If proxy reconnected, ni->enonce1 differs from subproxy->enonce1 and molepool
+			 * would reject as "Low difficulty share" because it computes with the old session. */
+			if (ni->enonce1 && subproxy->enonce1 &&
+			    strcmp(ni->enonce1, subproxy->enonce1) != 0) {
+				LOGNOTICE("Dropping cross-session share: job enonce1=%s current proxy %d:%d enonce1=%s",
+					  ni->enonce1, subproxy->id, subproxy->subid, subproxy->enonce1);
+			} else {
+				jobid = json_copy(ni->jobid);
+			}
+		}
 		mutex_unlock(&gdata->notify_lock);
 
 		if (unlikely(!jobid)) {
@@ -1953,12 +1995,38 @@ static void *proxy_send(void *arg)
 			continue;
 		}
 
-		JSON_CPACK(val, "{s[soooo]soss}", "params", subproxy->auth, jobid,
-				json_object_dup(msg->json_msg, "nonce2"),
-				json_object_dup(msg->json_msg, "ntime"),
-				json_object_dup(msg->json_msg, "nonce"),
-				"id", json_object_dup(msg->json_msg, "id"),
-				"method", "mining.submit");
+		{
+			const char *n2 = json_string_value(json_object_get(msg->json_msg, "nonce2"));
+			const char *nt = json_string_value(json_object_get(msg->json_msg, "ntime"));
+			const char *nc = json_string_value(json_object_get(msg->json_msg, "nonce"));
+			const char *jid_s = json_string_value(jobid);
+			json_int_t vm = json_integer_value(json_object_get(msg->json_msg, "version_mask"));
+			LOGNOTICE("Upstream submit: proxy=%d:%d jobid=%s nonce2=%s ntime=%s nonce=%s version_mask=%08x",
+				  subproxy->id, subproxy->subid, jid_s ? jid_s : "?",
+				  n2 ? n2 : "?", nt ? nt : "?", nc ? nc : "?", (uint32_t)vm);
+		}
+		{
+			json_t *vm_obj = json_object_get(msg->json_msg, "version_mask");
+			uint32_t version_mask = vm_obj ? (uint32_t)json_integer_value(vm_obj) : 0;
+			if (version_mask) {
+				char version_bits_str[9];
+				snprintf(version_bits_str, sizeof(version_bits_str), "%08x", version_mask);
+				JSON_CPACK(val, "{s[sooooo]soss}", "params", subproxy->auth, jobid,
+						json_object_dup(msg->json_msg, "nonce2"),
+						json_object_dup(msg->json_msg, "ntime"),
+						json_object_dup(msg->json_msg, "nonce"),
+						json_string(version_bits_str),
+						"id", json_object_dup(msg->json_msg, "id"),
+						"method", "mining.submit");
+			} else {
+				JSON_CPACK(val, "{s[soooo]soss}", "params", subproxy->auth, jobid,
+						json_object_dup(msg->json_msg, "nonce2"),
+						json_object_dup(msg->json_msg, "ntime"),
+						json_object_dup(msg->json_msg, "nonce"),
+						"id", json_object_dup(msg->json_msg, "id"),
+						"method", "mining.submit");
+			}
+		}
 		add_json_msgq(&csmsgq, subproxy, &val);
 		send_json_msgq(gdata, &csmsgq);
 	}

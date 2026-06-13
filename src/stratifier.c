@@ -3572,28 +3572,28 @@ static void update_diff(ckpool_t *ckp, const char *cmd)
 
 	dsdata = proxy->sdata;
 
-	if (unlikely(!dsdata->current_workbase)) {
-		LOGINFO("No current workbase to update diff yet");
-		return;
-	}
-
 	ck_wlock(&dsdata->workbase_lock);
 	old_diff = proxy->diff;
-	dsdata->current_workbase->diff = proxy->diff = diff;
+	proxy->diff = diff;
+	if (unlikely(!dsdata->current_workbase)) {
+		/* Store diff in proxy so the next workbase will inherit it */
+		ck_wunlock(&dsdata->workbase_lock);
+		LOGINFO("No current workbase to update diff yet, storing diff %.0f in proxy", diff);
+		return;
+	}
+	dsdata->current_workbase->diff = diff;
 	ck_wunlock(&dsdata->workbase_lock);
 
-	if (old_diff < diff)
-		return;
-
-	/* If the diff has dropped, iterate over all the clients and check
-	 * they're at or below the new diff, and update it if not. */
+	/* Notify miners on any diff change (both increases and decreases).
+	 * In proxy mode the upstream pool controls vardiff; we must mirror it
+	 * in both directions so miners always mine at the correct threshold. */
 	ck_rlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
 		if (client->proxyid != id)
 			continue;
 		if (client->subproxyid != subid)
 			continue;
-		if (client->diff > diff) {
+		if (client->diff != diff) {
 			client->diff = diff;
 			stratum_send_diff(sdata, client);
 		}
@@ -6558,16 +6558,23 @@ static void update_client(const stratum_instance_t *client, const int64_t client
 /* Submit a share in proxy mode to the parent pool. workbase_lock is held.
  * Needs to be entered with client holding a ref count. */
 static void submit_share(stratum_instance_t *client, const int64_t jobid, const char *nonce2,
-			 const char *ntime, const char *nonce)
+			 const char *ntime, const char *nonce, const uint32_t version_mask)
 {
 	ckpool_t *ckp = client->ckp;
 	json_t *json_msg;
 	char enonce2[32];
 
 	sprintf(enonce2, "%s%s", client->enonce1var, nonce2);
-	JSON_CPACK(json_msg, "{sIsssssssIsIsi}", "jobid", jobid, "nonce2", enonce2,
-			     "ntime", ntime, "nonce", nonce, "client_id", client->id,
-			     "proxy", client->proxyid, "subproxy", client->subproxyid);
+	if (version_mask) {
+		JSON_CPACK(json_msg, "{sIsssssssIsIsisi}", "jobid", jobid, "nonce2", enonce2,
+				     "ntime", ntime, "nonce", nonce, "client_id", client->id,
+				     "proxy", client->proxyid, "subproxy", client->subproxyid,
+				     "version_mask", (int)version_mask);
+	} else {
+		JSON_CPACK(json_msg, "{sIsssssssIsIsi}", "jobid", jobid, "nonce2", enonce2,
+				     "ntime", ntime, "nonce", nonce, "client_id", client->id,
+				     "proxy", client->proxyid, "subproxy", client->subproxyid);
+	}
 	generator_add_send(ckp, json_msg);
 }
 
@@ -6899,7 +6906,7 @@ out_nowb:
 	 * stale shares and filter out the rest. */
 	if (wb && wb->proxy && submit) {
 		LOGINFO("Submitting share upstream: %s", hexhash);
-		submit_share(client, id, nonce2, ntime, nonce);
+		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
 	}
 
 	add_submit(ckp, client, diff, result, submit);
