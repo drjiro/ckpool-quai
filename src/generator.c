@@ -1941,7 +1941,7 @@ static void *proxy_send(void *arg)
 		}
 
 		mutex_lock(&gdata->notify_lock);
-		HASH_FIND_INT(gdata->notify_instances, &id, ni);
+		HASH_FIND_I64(gdata->notify_instances, &id, ni);
 		if (ni)
 			jobid = json_copy(ni->jobid);
 		mutex_unlock(&gdata->notify_lock);
