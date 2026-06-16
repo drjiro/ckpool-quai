@@ -574,6 +574,7 @@ reparse:
 		 * do this unlocked as the occasional false negative can be
 		 * filtered by the stratifier. */
 		if (likely(!client->invalid)) {
+			LOGWARNING("Client %"PRId64" raw msg: %.*s", client->id, buflen - 1, client->buf);
 			if (!ckp->passthrough)
 				stratifier_add_recv(ckp, val);
 			if (ckp->node)

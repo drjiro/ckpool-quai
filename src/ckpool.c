@@ -1488,6 +1488,7 @@ static void parse_config(ckpool_t *ckp)
 	json_get_int64(&ckp->highdiff, json_conf, "highdiff");
 	json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
 	json_get_string(&ckp->logdir, json_conf, "logdir");
+	json_get_int(&ckp->loglevel, json_conf, "loglevel");
 	json_get_int(&ckp->maxclients, json_conf, "maxclients");
 	json_get_int(&ckp->port, json_conf, "port");
 	json_get_bool(&ckp->scrypt_algo, json_conf, "scrypt_algo");

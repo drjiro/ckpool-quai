@@ -6424,8 +6424,10 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 		wb->coinb1len, wb->enonce1constlen + wb->enonce1varlen, wb->enonce2varlen,
 		cb2len, cblen + cb2len);
 
-	/* Guard: if using new Quai format with OP_PUSH42, verify coinb2 starts with 30 zeros + signature time */
-	if (wb->coinb1len > 0 && wb->coinb1bin[wb->coinb1len - 1] == 0x2a) { /* OP_PUSH42 */
+	/* Guard: if using new Quai format with OP_PUSH42, verify coinb2 starts with 30 zeros + signature time.
+	 * This only applies to solo mode (GBT coinbase from go-quai). In proxy mode the coinb2 comes from
+	 * the upstream pool (Kryptex) and has a different structure — skip this check. */
+	if (!client->ckp->proxy && wb->coinb1len > 0 && wb->coinb1bin[wb->coinb1len - 1] == 0x2a) { /* OP_PUSH42 */
 		static const unsigned char zeros30[30] = {0};
 		if (cb2len < 30 || memcmp(coinb2bin, zeros30, 30) != 0) {
 			LOGWARNING("coinb2 does not start with 30 zero extraData bytes; "
@@ -7027,43 +7029,21 @@ static json_t *__stratum_notify(const workbase_t *wb, const bool clean)
 			"id", json_null(),
 			"method", "mining.notify");
 
-	/* Log the mining.notify message for debugging */
-	char *notify_str = json_dumps(val, JSON_COMPACT);
-	if (notify_str) {
-		LOGNOTICE("MINING.NOTIFY: %s", notify_str);
-		LOGNOTICE("  Job ID: %s (workbase id: %"PRId64")", wb->idstring, wb->id);
-		LOGNOTICE("  Clean: %s, Height: %d", clean ? "true" : "false", wb->height);
-		free(notify_str);
-	}
-
 	return val;
 }
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, const bool clean)
 {
-    int repeats = clean ? 5 : 1;
+	json_t *json_msg;
 
-    LOGNOTICE("Broadcasting stratum update with clean=%s for workbase id %"PRId64,
-        clean ? "true" : "false", wb->id);
+	LOGINFO("Broadcasting stratum update with clean=%s for workbase id %"PRId64,
+		clean ? "true" : "false", wb->id);
 
-    for (int i = 0; i < repeats; i++) {
-        json_t *json_msg;
+	ck_rlock(&sdata->workbase_lock);
+	json_msg = __stratum_notify(wb, clean);
+	ck_runlock(&sdata->workbase_lock);
 
-        ck_rlock(&sdata->workbase_lock);
-        json_msg = __stratum_notify(wb, clean);
-        ck_runlock(&sdata->workbase_lock);
-
-        /* Log the actual JSON being sent to debug clean flag - only first repeat to reduce spam */
-        if (clean && i == 0) {
-            char *json_str = json_dumps(json_msg, JSON_COMPACT);
-            if (json_str) {
-                LOGWARNING("CLEAN JOB NOTIFICATION being sent (x5)");
-                free(json_str);
-            }
-        }
-
-        stratum_broadcast(sdata, json_msg, SM_UPDATE);
-    }
+	stratum_broadcast(sdata, json_msg, SM_UPDATE);
 }
 
 /* For sending a single stratum template update */
@@ -7114,14 +7094,6 @@ static json_t *__user_notify(const workbase_t *wb, const user_instance_t *user, 
 			"id", json_null(),
 			"method", "mining.notify");
 
-	/* Log the mining.notify message for debugging (btcsolo mode) */
-	char *notify_str = json_dumps(val, JSON_COMPACT);
-	if (notify_str) {
-		LOGNOTICE("MINING.NOTIFY (btcsolo): %s", notify_str);
-		LOGNOTICE("  Job ID: %s (workbase id: %"PRId64", user: %s)", wb->idstring, wb->id, user->username);
-		LOGNOTICE("  Clean: %s, Height: %d", clean ? "true" : "false", wb->height);
-		free(notify_str);
-	}
 
 	return val;
 }
@@ -7134,59 +7106,33 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
     double new_share_diff = 0;
     ckpool_t *ckp = sdata->ckp;
 
-    LOGNOTICE("Broadcasting stratum updates to all clients with clean=%s",
-        clean ? "true" : "false");
+	LOGINFO("Broadcasting stratum updates to all clients with clean=%s",
+		clean ? "true" : "false");
 
 	/* For btcsolo mode, check if share_diff has changed */
 	if (ckp->btcsolo && sdata->current_workbase) {
 		new_share_diff = sdata->current_workbase->share_diff;
 	}
 
-    ck_wlock(&sdata->instance_lock);
-    HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
-        if (!client->user_instance)
-            continue;
-        __inc_instance_ref(client);
-        ck_wunlock(&sdata->instance_lock);
+	ck_wlock(&sdata->instance_lock);
+	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
+		json_t *json_msg;
 
-        /* Disabled: do not update client diff from GBT target in btcsolo mode */
-        /* GBT target diff (~76M+) is too high for ASIC shares; use vardiff/startdiff instead */
-        if (0) {
-            client->old_diff = client->diff;
-            strncpy(client->old_target, client->target, 68);
-            client->diff = new_share_diff < 1.0 ? 1 : new_share_diff;
-            if (sdata->current_workbase && sdata->current_workbase->target[0]) {
-                strncpy(client->target, sdata->current_workbase->target, 68);
-            }
-            LOGNOTICE("Updating client %ld diff from %ld to %ld based on new GBT target (share_diff %.6f)",
-                client->id, client->old_diff, client->diff, new_share_diff);
-            stratum_send_diff(sdata, client);
-        }
+		if (!client->user_instance)
+			continue;
+		__inc_instance_ref(client);
+		ck_wunlock(&sdata->instance_lock);
 
-        /* Disabled: do not update client target from GBT network target */
-        /* GBT target (~89M diff) would override startdiff target, rejecting all shares */
-        if (0) {
-            if (strcmp(client->target, sdata->current_workbase->target) != 0) {
-                strncpy(client->target, sdata->current_workbase->target, 68);
-                LOGDEBUG("Updated client %ld target from workbase", client->id);
-            }
-        }
+		ck_rlock(&sdata->workbase_lock);
+		json_msg = __user_notify(sdata->current_workbase, client->user_instance, clean);
+		ck_runlock(&sdata->workbase_lock);
+		if (likely(json_msg))
+			stratum_add_send(sdata, json_msg, client->id, SM_UPDATE);
 
-        /* Repeat clean notifications to improve reliability */
-        int repeats = clean ? 5 : 1;
-        for (int i = 0; i < repeats; i++) {
-            json_t *json_msg;
-            ck_rlock(&sdata->workbase_lock);
-            json_msg = __user_notify(sdata->current_workbase, client->user_instance, clean);
-            ck_runlock(&sdata->workbase_lock);
-            if (likely(json_msg))
-                stratum_add_send(sdata, json_msg, client->id, SM_UPDATE);
-        }
-
-        ck_wlock(&sdata->instance_lock);
-        __dec_instance_ref(client);
-    }
-    ck_wunlock(&sdata->instance_lock);
+		ck_wlock(&sdata->instance_lock);
+		__dec_instance_ref(client);
+	}
+	ck_wunlock(&sdata->instance_lock);
 }
 
 static void send_json_err(sdata_t *sdata, const int64_t client_id, json_t *id_val, const char *err_msg)
