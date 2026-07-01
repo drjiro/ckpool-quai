@@ -121,8 +121,10 @@ static const char *gbt_req_scrypt = "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"met
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
- * required to assemble a mining template, storing it in a gbtbase_t structure */
-bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt, bool scrypt_algo)
+ * required to assemble a mining template, storing it in a gbtbase_t structure.
+ * If coinbase_addr is non-NULL, include it in the GBT request so go-quai sets
+ * the correct PrimaryCoinbase (QUAI ETX mining reward destination). */
+bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt, bool scrypt_algo, const char *coinbase_addr)
 {
 	json_t *rules_array, *res_val, *val;
 	const char *previousblockhash;
@@ -139,7 +141,18 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt, bool scrypt_algo)
 	bool ret = false;
 
 	/* Use appropriate GBT request based on algorithm */
-	const char *gbt_req = scrypt_algo ? gbt_req_scrypt : gbt_req_sha;
+	const char *gbt_req;
+	char gbt_req_buf[512];
+	if (coinbase_addr && *coinbase_addr) {
+		const char *algo = scrypt_algo ? "scrypt" : "sha";
+		snprintf(gbt_req_buf, sizeof(gbt_req_buf),
+			"{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_getBlockTemplate\", "
+			"\"params\": [{\"rules\": [\"%s\"], \"coinbase\": \"%s\"}]}\n",
+			algo, coinbase_addr);
+		gbt_req = gbt_req_buf;
+	} else {
+		gbt_req = scrypt_algo ? gbt_req_scrypt : gbt_req_sha;
+	}
 	val = json_rpc_call(cs, gbt_req);
 	if (!val) {
 		LOGWARNING("%s:%s Failed to get valid json response to quai_getBlockTemplate", cs->url, cs->port);

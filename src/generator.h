@@ -18,6 +18,7 @@
 
 void generator_add_send(ckpool_t *ckp, json_t *val);
 struct genwork *generator_getbase(ckpool_t *ckp);
+struct genwork *generator_getbase_for_address(ckpool_t *ckp, const char *coinbase_addr);
 int generator_getbest(ckpool_t *ckp, char *hash);
 bool generator_checkaddr(ckpool_t *ckp, const char *addr, bool *script, bool *segwit);
 bool generator_checktxn(const ckpool_t *ckp, const char *txn, json_t **val);

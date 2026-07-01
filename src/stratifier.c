@@ -116,6 +116,11 @@ struct userwb {
 	uchar *coinb2bin; // Coinb2 cointaining this user's address for generation
 	char *coinb2;
 	int coinb2len; // Length of user coinb2
+
+	/* Per-user coinb1 for non-custodial QUAI mining (different SealHash per address) */
+	uchar *coinb1bin;
+	char  *coinb1;
+	int    coinb1len;
 };
 
 struct user_instance;
@@ -167,6 +172,12 @@ struct user_instance {
 	time_t failed_authtime; /* Last time this username failed to authorise */
 	int auth_backoff; /* How long to reject any auth attempts since last failure */
 	bool throttled; /* Have we begun rejecting auth attempts */
+
+	/* QUAI non-custodial: per-user coinb1 fetched via GBT with user's address */
+	char  quai_address[128]; /* QUAI address extracted from username (0x...) */
+	char  *quai_coinb1;      /* coinb1 hex for this user's address */
+	uchar *quai_coinb1bin;
+	int    quai_coinb1len;
 };
 
 /* Combined data from workers with the same workername */
@@ -967,6 +978,8 @@ static void clear_userwb(sdata_t *sdata, int64_t id)
 		HASH_DEL(instance->userwbs, userwb);
 		free(userwb->coinb2bin);
 		free(userwb->coinb2);
+		free(userwb->coinb1bin);
+		free(userwb->coinb1);
 		free(userwb);
 	}
 	ck_wunlock(&sdata->instance_lock);
@@ -1227,6 +1240,15 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 		userwb->coinb2len += wb->coinb3len;
 	}
 	userwb->coinb2 = bin2hex(userwb->coinb2bin, userwb->coinb2len);
+
+	/* Copy per-user coinb1 if available (non-custodial QUAI mining) */
+	if (user->quai_coinb1bin && user->quai_coinb1len > 0) {
+		userwb->coinb1len = user->quai_coinb1len;
+		userwb->coinb1bin = ckalloc(userwb->coinb1len);
+		memcpy(userwb->coinb1bin, user->quai_coinb1bin, userwb->coinb1len);
+		userwb->coinb1 = strdup(user->quai_coinb1);
+	}
+
 	HASH_ADD_I64(user->userwbs, id, userwb);
 }
 
@@ -1243,6 +1265,82 @@ static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
 	ck_wunlock(&sdata->instance_lock);
 }
 
+/* Extract the QUAI address (0x...) from a username like "0xABC....worker1".
+ * Writes to addr_out (128 bytes). Returns true if found. */
+static bool extract_quai_address(const char *username, char *addr_out)
+{
+	if (strncmp(username, "0x", 2) != 0 && strncmp(username, "0X", 2) != 0)
+		return false;
+	const char *dot = strchr(username, '.');
+	size_t len = dot ? (size_t)(dot - username) : strlen(username);
+	if (len < 10 || len >= 128)
+		return false;
+	memcpy(addr_out, username, len);
+	addr_out[len] = '\0';
+	return true;
+}
+
+/* Fetch per-user coinb1 from go-quai GBT for all connected QUAI miners.
+ * Called outside locks since GBT is an HTTP call. */
+static void refresh_all_user_coinb1s(ckpool_t *ckp, sdata_t *sdata)
+{
+	/* Collect addresses outside of heavy GBT calls */
+	typedef struct { char addr[128]; int id; } addr_entry_t;
+	addr_entry_t *entries = NULL;
+	int count = 0, capacity = 16;
+	user_instance_t *instance, *tmp;
+
+	entries = ckzalloc(sizeof(addr_entry_t) * capacity);
+
+	ck_rlock(&sdata->instance_lock);
+	HASH_ITER(hh, sdata->user_instances, instance, tmp) {
+		char addr[128];
+		if (!extract_quai_address(instance->username, addr))
+			continue;
+		if (count >= capacity) {
+			capacity *= 2;
+			entries = realloc(entries, sizeof(addr_entry_t) * capacity);
+		}
+		memcpy(entries[count].addr, addr, 128);
+		entries[count].id = instance->id;
+		count++;
+	}
+	ck_runlock(&sdata->instance_lock);
+
+	for (int i = 0; i < count; i++) {
+		gbtbase_t *gbt = generator_getbase_for_address(ckp, entries[i].addr);
+		if (!gbt)
+			continue;
+		if (!gbt->coinb1 || gbt->coinb1len <= 0) {
+			clear_gbtbase(gbt);
+			free(gbt);
+			continue;
+		}
+
+		/* Update user instance with their coinb1 */
+		ck_wlock(&sdata->instance_lock);
+		HASH_ITER(hh, sdata->user_instances, instance, tmp) {
+			if (instance->id != entries[i].id)
+				continue;
+			free(instance->quai_coinb1);
+			free(instance->quai_coinb1bin);
+			instance->quai_coinb1len = gbt->coinb1len;
+			instance->quai_coinb1bin = ckalloc(gbt->coinb1len);
+			memcpy(instance->quai_coinb1bin, gbt->coinb1bin, gbt->coinb1len);
+			instance->quai_coinb1 = strdup(gbt->coinb1);
+			memcpy(instance->quai_address, entries[i].addr, 128);
+			LOGNOTICE("Updated coinb1 for QUAI address %s (len=%d)",
+				entries[i].addr, gbt->coinb1len);
+			break;
+		}
+		ck_wunlock(&sdata->instance_lock);
+
+		clear_gbtbase(gbt);
+		free(gbt);
+	}
+	free(entries);
+}
+
 /* Add a new workbase to the table of workbases. Sdata is the global data in
  * pool mode but unique to each subproxy in proxy mode */
 static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_block)
@@ -1255,15 +1353,18 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 
 	ts_realtime(&wb->gentime);
     /* Stats network_diff is not protected by lock but is not a critical
-     * value. For Scrypt, prefer the explicit target-derived share_diff
-     * from GBT if present; fall back to nbits if needed. */
+     * value. Prefer the explicit target-derived share_diff from GBT if
+     * present (Quai provides this); fall back to nbits if needed. */
     if (wb->scrypt_algo) {
         if (wb->share_diff > 0)
             wb->network_diff = wb->share_diff;
         else
             wb->network_diff = diff_from_nbits_scrypt(wb->headerbin + 72);
     } else {
-        wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+        if (wb->share_diff > 0)
+            wb->network_diff = wb->share_diff;
+        else
+            wb->network_diff = diff_from_nbits(wb->headerbin + 72);
     }
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
@@ -1334,8 +1435,12 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 	/* This wb can't be pulled out from under us so no workbase lock is
 	 * required to generate_userwbs */
 	/* Generate userwbs for btcsolo. For Quai, user->txnlen is 0 so no extra data added */
-	if (ckp->btcsolo)
+	if (ckp->btcsolo) {
+		/* Refresh per-user coinb1 first (GBT with each user's QUAI address).
+		 * Must be done BEFORE generate_userwbs so userwbs get the updated coinb1. */
+		refresh_all_user_coinb1s(ckp, sdata);
 		generate_userwbs(sdata, wb);
+	}
 
 	if (*new_block)
 		purge_share_hashtable(sdata, wb->id);
@@ -4228,7 +4333,7 @@ static void block_share_summary(sdata_t *sdata)
 
 static void block_solve(ckpool_t *ckp, json_t *val)
 {
-	char *msg, *workername = NULL;
+	char *msg, *workername = NULL, *blockhash = NULL;
 	sdata_t *sdata = ckp->sdata;
 	char cdfield[64];
 	double diff = 0;
@@ -4244,6 +4349,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 	json_get_int(&height, val, "height");
 	json_get_double(&diff, val, "diff");
 	json_get_string(&workername, val, "workername");
+	json_get_string(&blockhash, val, "blockhash");
 
 	if (!workername) {
 		ASPRINTF(&msg, "Block solved by %s!", ckp->name);
@@ -4255,7 +4361,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 		char *s;
 
 		ASPRINTF(&msg, "Block %d solved by %s @ %s!", height, workername, ckp->name);
-		LOGWARNING("Solved and confirmed block %d by %s", height, workername);
+		LOGWARNING("Solved and confirmed block %d by %s hash %s", height, workername, blockhash ? blockhash : "unknown");
 		user = user_by_workername(sdata, workername);
 		worker = get_worker(sdata, user, workername);
 
@@ -4277,6 +4383,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 	free(msg);
 
 	free(workername);
+	free(blockhash);
 
 	block_share_summary(sdata);
 	reset_bestshares(sdata);
@@ -6394,6 +6501,27 @@ out_nouserwb:
 	return wb->coinb2bin;
 }
 
+/* Returns per-user coinb1 for non-custodial QUAI mining, falls back to global wb->coinb1bin */
+static inline const uchar *__user_coinb1(const stratum_instance_t *client, const workbase_t *wb, int *cb1len)
+{
+	struct userwb *userwb;
+	int64_t id;
+
+	if (!client->ckp->btcsolo)
+		goto out_nouserwb;
+
+	id = wb->id;
+	HASH_FIND_I64(client->user_instance->userwbs, &id, userwb);
+	if (!userwb || !userwb->coinb1bin || userwb->coinb1len <= 0)
+		goto out_nouserwb;
+	*cb1len = userwb->coinb1len;
+	return userwb->coinb1bin;
+
+out_nouserwb:
+	*cb1len = wb->coinb1len;
+	return wb->coinb1bin;
+}
+
 /* Needs to be entered with workbase readcount and client holding a ref count. */
 static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, const workbase_t *wb,
 			      const char *nonce2, const uint32_t ntime32, uint32_t version_mask,
@@ -6410,9 +6538,16 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	/* Leave ample enough room for donation generation address (~25) + length counter + user generation
 	 * wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len + 25 + cb2len */
 
+	/* Use per-user coinb1 if available (non-custodial QUAI: SealHash contains user's address) */
+	ck_rlock(&sdata->instance_lock);
+	int cb1len;
+	const uchar *coinb1bin = __user_coinb1(client, wb, &cb1len);
+
 	coinbase = alloca(1024);
-	memcpy(coinbase, wb->coinb1bin, wb->coinb1len);
-	cblen = wb->coinb1len;
+	memcpy(coinbase, coinb1bin, cb1len);
+	cblen = cb1len;
+	ck_runlock(&sdata->instance_lock);
+
 	memcpy(coinbase + cblen, &client->enonce1bin, wb->enonce1constlen + wb->enonce1varlen);
 	cblen += wb->enonce1constlen + wb->enonce1varlen;
 	hex2bin(coinbase + cblen, nonce2, wb->enonce2varlen);
@@ -6421,13 +6556,13 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	ck_rlock(&sdata->instance_lock);
 	coinb2bin = __user_coinb2(client, wb, &cb2len);
 	LOGNOTICE("Building coinbase: coinb1len=%d enonce1=%d enonce2=%d coinb2len=%d total=%d",
-		wb->coinb1len, wb->enonce1constlen + wb->enonce1varlen, wb->enonce2varlen,
+		cb1len, wb->enonce1constlen + wb->enonce1varlen, wb->enonce2varlen,
 		cb2len, cblen + cb2len);
 
 	/* Guard: if using new Quai format with OP_PUSH42, verify coinb2 starts with 30 zeros + signature time.
 	 * This only applies to solo mode (GBT coinbase from go-quai). In proxy mode the coinb2 comes from
 	 * the upstream pool (Kryptex) and has a different structure — skip this check. */
-	if (!client->ckp->proxy && wb->coinb1len > 0 && wb->coinb1bin[wb->coinb1len - 1] == 0x2a) { /* OP_PUSH42 */
+	if (!client->ckp->proxy && cb1len > 0 && coinb1bin[cb1len - 1] == 0x2a) { /* OP_PUSH42 */
 		static const unsigned char zeros30[30] = {0};
 		if (cb2len < 30 || memcmp(coinb2bin, zeros30, 30) != 0) {
 			LOGWARNING("coinb2 does not start with 30 zero extraData bytes; "
@@ -7080,11 +7215,14 @@ static json_t *__user_notify(const workbase_t *wb, const user_instance_t *user, 
 		return NULL;
 	}
 
+	/* Use per-user coinb1 if available (non-custodial QUAI: each user mines with their SealHash) */
+	const char *coinb1 = (userwb->coinb1 && userwb->coinb1len > 0) ? userwb->coinb1 : wb->coinb1;
+
 	JSON_CPACK(val, "{s:[ssssosssb],s:o,s:s}",
 			"params",
 			wb->idstring,
 			wb->prevhash,
-			wb->coinb1,
+			coinb1,
 			userwb->coinb2,
 			json_deep_copy(wb->merkle_array),
 			wb->bbversion,
@@ -7093,7 +7231,6 @@ static json_t *__user_notify(const workbase_t *wb, const user_instance_t *user, 
 			clean,
 			"id", json_null(),
 			"method", "mining.notify");
-
 
 	return val;
 }

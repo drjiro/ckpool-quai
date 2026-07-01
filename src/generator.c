@@ -247,7 +247,7 @@ static bool server_alive(ckpool_t *ckp, server_instance_t *si, bool pinging)
 	}
 
 	/* Test we can connect, authorise and get a block template */
-	if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo)) {
+	if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo, NULL)) {
 		if (!pinging) {
 			LOGINFO("Failed to get test block template from %s:%s!",
 				cs->url, cs->port);
@@ -429,7 +429,7 @@ retry:
 	buf = umsg->buf;
 	LOGDEBUG("Generator received request: %s", buf);
 	if (cmdmatch(buf, "getbase")) {
-		if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo)) {
+		if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo, NULL)) {
 			LOGWARNING("Failed to get block template from %s:%s",
 				   cs->url, cs->port);
 			si->alive = cs->alive = false;
@@ -872,10 +872,35 @@ struct genwork *generator_getbase(ckpool_t *ckp)
 	}
 	cs = &si->cs;
 	gbt = ckzalloc(sizeof(gbtbase_t));
-	if (unlikely(!gen_gbtbase(cs, gbt, ckp->scrypt_algo))) {
+	if (unlikely(!gen_gbtbase(cs, gbt, ckp->scrypt_algo, NULL))) {
 		LOGWARNING("Failed to get block template from %s:%s", cs->url, cs->port);
 		si->alive = cs->alive = false;
 		reconnect_generator(ckp);
+		dealloc(gbt);
+	}
+out:
+	return gbt;
+}
+
+/* Like generator_getbase() but requests GBT with a specific QUAI coinbase address.
+ * Used for non-custodial mining so each worker's reward goes to their own address. */
+struct genwork *generator_getbase_for_address(ckpool_t *ckp, const char *coinbase_addr)
+{
+	gdata_t *gdata = ckp->gdata;
+	gbtbase_t *gbt = NULL;
+	server_instance_t *si;
+	connsock_t *cs;
+
+	si = gdata->current_si;
+	if (unlikely(!si)) {
+		LOGWARNING("No live current server in generator_getbase_for_address");
+		goto out;
+	}
+	cs = &si->cs;
+	gbt = ckzalloc(sizeof(gbtbase_t));
+	if (unlikely(!gen_gbtbase(cs, gbt, ckp->scrypt_algo, coinbase_addr))) {
+		LOGWARNING("Failed to get block template for address %s from %s:%s",
+			coinbase_addr, cs->url, cs->port);
 		dealloc(gbt);
 	}
 out:
